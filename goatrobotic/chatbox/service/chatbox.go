@@ -1,48 +1,59 @@
+// Package service provides an optimized concurrent chat service.
 package service
 
 import (
 	"context"
 	"errors"
-	"log"
 	"sync"
 	"time"
 
 	errcom "chatbox/error"
 	"chatbox/model"
+
+	"golang.org/x/time/rate"
 )
 
-const (
-	channelBufferSize = 100
-	messageTimeout    = 10 * time.Second
-	clientTTL         = 5 * time.Minute
-	cleanupInterval   = 1 * time.Minute
-)
+type Client struct {
+	ID          string
+	Ch          chan string
+	LastSeen    time.Time
+	RateLimiter *rate.Limiter
+}
 
 type ChatService interface {
 	Join(ctx context.Context, req model.JoinRequest) (*model.JoinResponse, error)
 	SendMessage(ctx context.Context, req model.SendMessageRequest) (*model.SendMessageResponse, error)
 	Leave(ctx context.Context, req model.LeaveRequest) (*model.LeaveResponse, error)
 	GetMessage(ctx context.Context, req model.MessageRequest) (*model.MessageResponse, error)
-	ClientCount() int
-}
-
-type client struct {
-	id       string
-	ch       chan string
-	lastSeen time.Time
 }
 
 type chatService struct {
 	mu      sync.RWMutex
-	streams map[string]*client
+	streams map[string]*Client
 }
 
 func NewChatService() ChatService {
 	s := &chatService{
-		streams: make(map[string]*client),
+		streams: make(map[string]*Client),
 	}
-	go s.cleanupIdleClients()
+	s.startCleanupLoop()
 	return s
+}
+
+func (s *chatService) startCleanupLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for range ticker.C {
+			s.mu.Lock()
+			for id, client := range s.streams {
+				if time.Since(client.LastSeen) > 5*time.Minute {
+					close(client.Ch)
+					delete(s.streams, id)
+				}
+			}
+			s.mu.Unlock()
+		}
+	}()
 }
 
 func (s *chatService) Join(ctx context.Context, req model.JoinRequest) (*model.JoinResponse, error) {
@@ -53,18 +64,16 @@ func (s *chatService) Join(ctx context.Context, req model.JoinRequest) (*model.J
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Clean up any existing client with same ID
-	if oldClient, exists := s.streams[req.ID]; exists {
-		close(oldClient.ch)
+	if _, exists := s.streams[req.ID]; exists {
+		return nil, errcom.NewCustomError("ERR_ALREADY_JOINED", errors.New("user already joined"))
 	}
 
-	s.streams[req.ID] = &client{
-		id:       req.ID,
-		ch:       make(chan string, channelBufferSize),
-		lastSeen: time.Now(),
+	s.streams[req.ID] = &Client{
+		ID:          req.ID,
+		Ch:          make(chan string, 10),
+		LastSeen:    time.Now(),
+		RateLimiter: rate.NewLimiter(1, 5),
 	}
-
-	log.Printf("[JOIN] %s joined", req.ID)
 
 	return &model.JoinResponse{
 		Success: true,
@@ -77,30 +86,47 @@ func (s *chatService) SendMessage(ctx context.Context, req model.SendMessageRequ
 		return nil, errcom.NewCustomError("ERR_MISSING_FIELD", errors.New("From and Message are required"))
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if len(req.Message) > 500 {
+		return nil, errcom.NewCustomError("ERR_MESSAGE_TOO_LONG", errors.New("message must be under 500 characters"))
+	}
 
-	count := 0
-	for id, cl := range s.streams {
+	s.mu.RLock()
+	sender, exists := s.streams[req.From]
+	if !exists {
+		s.mu.RUnlock()
+		return nil, errcom.NewCustomError("ERR_SENDER_NOT_FOUND", errors.New("sender not connected"))
+	}
+	if !sender.RateLimiter.Allow() {
+		s.mu.RUnlock()
+		return nil, errcom.NewCustomError("ERR_RATE_LIMIT", errors.New("too many messages"))
+	}
+
+	message := req.From + ": " + req.Message
+	sentCount := 0
+	for id, client := range s.streams {
 		if id == req.From {
 			continue
 		}
-		select {
-		case cl.ch <- req.From + ": " + req.Message:
-			count++
-		default:
-			log.Printf("[WARN] Skipping %s (channel full)", id)
-		}
-	}
 
-	if count == 0 {
+		go func(c *Client) {
+			select {
+			case c.Ch <- message:
+				// sent
+			default:
+				// skip if buffer full
+			}
+		}(client)
+		sentCount++
+	}
+	s.mu.RUnlock()
+
+	if sentCount == 0 {
 		return nil, errcom.NewCustomError("ERR_NO_RECEIVERS", errors.New("no clients received the message"))
 	}
 
-	log.Printf("[SEND] %s to %d clients", req.From, count)
 	return &model.SendMessageResponse{
 		Success: true,
-		Message: "Message broadcasted",
+		Message: "Message broadcasted to clients",
 	}, nil
 }
 
@@ -110,21 +136,19 @@ func (s *chatService) Leave(ctx context.Context, req model.LeaveRequest) (*model
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	cl, exists := s.streams[req.ID]
+	client, exists := s.streams[req.ID]
 	if !exists {
+		s.mu.Unlock()
 		return nil, errcom.NewCustomError("ERR_USER_NOT_FOUND", errors.New("user not connected"))
 	}
-
-	close(cl.ch)
 	delete(s.streams, req.ID)
+	s.mu.Unlock()
 
-	log.Printf("[LEAVE] %s left the chat", req.ID)
+	close(client.Ch)
 
 	return &model.LeaveResponse{
 		Success: true,
-		Message: "User disconnected",
+		Message: "User disconnected successfully",
 	}, nil
 }
 
@@ -134,46 +158,22 @@ func (s *chatService) GetMessage(ctx context.Context, req model.MessageRequest) 
 	}
 
 	s.mu.RLock()
-	cl, exists := s.streams[req.ID]
+	client, exists := s.streams[req.ID]
 	s.mu.RUnlock()
 
 	if !exists {
 		return nil, errcom.NewCustomError("ERR_USER_NOT_FOUND", errors.New("user not connected"))
 	}
 
-	s.mu.Lock()
-	cl.lastSeen = time.Now()
-	s.mu.Unlock()
+	client.LastSeen = time.Now()
 
 	select {
-	case msg, ok := <-cl.ch:
+	case msg, ok := <-client.Ch:
 		if !ok {
-			return nil, errcom.NewCustomError("ERR_CHANNEL_CLOSED", errors.New("user's channel is closed"))
+			return nil, errcom.NewCustomError("ERR_USER_DISCONNECTED", errors.New("user stream closed"))
 		}
 		return &model.MessageResponse{Message: msg}, nil
-	case <-time.After(messageTimeout):
+	case <-time.After(10 * time.Second):
 		return nil, errcom.NewCustomError("ERR_NO_MESSAGES", errors.New("no messages received"))
 	}
-}
-
-func (s *chatService) cleanupIdleClients() {
-	for {
-		time.Sleep(cleanupInterval)
-		s.mu.Lock()
-		now := time.Now()
-		for id, cl := range s.streams {
-			if now.Sub(cl.lastSeen) > clientTTL {
-				log.Printf("[CLEANUP] Removing idle client: %s", id)
-				close(cl.ch)
-				delete(s.streams, id)
-			}
-		}
-		s.mu.Unlock()
-	}
-}
-
-func (s *chatService) ClientCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.streams)
 }
